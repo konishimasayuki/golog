@@ -468,6 +468,7 @@ function UserApp({ onLogout }) {
   const [autoRec, setAutoRec] = useState(true);
   const [voice, setVoice] = useState(true);
   const [cameraOn, setCameraOn] = useState(false);
+  const [camErr, setCamErr] = useState("");
   const [recState, setRecState] = useState("idle");
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult] = useState(null);
@@ -569,26 +570,53 @@ function UserApp({ onLogout }) {
   const [pinTarget, setPinTarget] = useState("center");
 
   const startCamera = async () => {
-    try { const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      streamRef.current = stream; if (videoRef.current) { videoRef.current.srcObject = stream; videoRef.current.play(); }
-      setCameraOn(true); if (autoRec) beginDetect();
-    } catch { alert("カメラを起動できませんでした。アクセスを許可してください。"); }
+    setCamErr("カメラ起動を試行中...");
+    // 1) mediaDevices の存在チェック（HTTP接続やWebView制限だとundefinedになる）
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCamErr("この環境ではカメラAPIが使えません（HTTPSでない／対応外ブラウザの可能性）。https://〜.vercel.app をSafariで直接開いて試してください。");
+      return;
+    }
+    try {
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+      } catch (e1) {
+        // 背面指定で失敗したら制約を緩めて再試行
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
+      streamRef.current = stream;
+      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play().catch(() => {}); }
+      setCameraOn(true); setCamErr(""); if (autoRec) beginDetect();
+    } catch (err) {
+      const name = err?.name || "Error";
+      const msg = {
+        NotAllowedError: "カメラへのアクセスが拒否されました。設定 > Safari > カメラ で「許可」にしてください。",
+        NotFoundError: "カメラが見つかりません。",
+        NotReadableError: "カメラが他のアプリで使用中の可能性があります。",
+        SecurityError: "セキュリティ制限でカメラを起動できません（HTTPS必須）。",
+        OverconstrainedError: "対応するカメラがありません。",
+        TypeError: "カメラAPIの呼び出しに失敗しました。",
+      }[name] || `カメラを起動できませんでした（${name}）`;
+      setCamErr(msg);
+    }
   };
   const beginDetect = () => { setRecState("detecting"); detectTimer.current = setTimeout(() => startRec(), 2500); };
   const startRec = () => {
     setRecState("recording"); setRecTime(0); setVideoUrl(null); setPoseFrames(null);
-    // 実録画
+    // 実録画（iOS Safariはwebm非対応 → mp4を優先、対応形式を自動判定）
     try {
       chunksRef.current = [];
-      const rec = new MediaRecorder(streamRef.current, { mimeType: "video/webm" });
+      const types = ["video/mp4", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+      const mimeType = types.find((t) => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+      const rec = mimeType ? new MediaRecorder(streamRef.current, { mimeType }) : new MediaRecorder(streamRef.current);
       rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
       rec.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: "video/webm" });
+        const blob = new Blob(chunksRef.current, { type: rec.mimeType || "video/mp4" });
         setVideoUrl(URL.createObjectURL(blob));
       };
       rec.start();
       recorderRef.current = rec;
-    } catch (e) { /* 非対応端末はデモ動作 */ }
+    } catch (e) { recorderRef.current = null; /* 録画非対応でもプレビュー継続 */ }
     recTimer.current = setInterval(() => setRecTime((t) => { if (t >= 3) { stopRec(); return t; } return t + 1; }), 700);
   };
   const stopRec = () => {
@@ -870,9 +898,11 @@ speed/distanceは骨格解析結果があればそれを優先。issuesは2-3個
             {/* カメラ */}
             <div style={{ position: "relative", borderRadius: 20, overflow: "hidden", aspectRatio: "9/13", maxHeight: 440, boxShadow: "0 8px 30px rgba(42,38,32,0.12)" }}>
               {cameraOn ? <video ref={videoRef} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} /> :
-                <div style={{ position: "absolute", inset: 0 }}><SwingStage frame={8} withSkeleton={false} />
-                  <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, color: "#fff" }}>
-                    <IconCamera size={40} stroke="#fff" sw={1.4} /><div style={{ fontSize: 13, opacity: 0.85 }}>タップしてカメラを起動</div>
+                <div onClick={startCamera} style={{ position: "absolute", inset: 0, cursor: "pointer" }}><SwingStage frame={8} withSkeleton={false} />
+                  <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, color: "#fff", padding: 20, textAlign: "center" }}>
+                    <IconCamera size={40} stroke="#fff" sw={1.4} />
+                    <div style={{ fontSize: 13, opacity: 0.85 }}>タップしてカメラを起動</div>
+                    {camErr && <div style={{ fontSize: 12, lineHeight: 1.6, color: "#fff", background: "rgba(181,80,63,0.9)", padding: "10px 14px", borderRadius: 10, maxWidth: 300 }}>{camErr}</div>}
                   </div></div>}
               {cameraOn && <svg style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }} viewBox="0 0 90 130" preserveAspectRatio="none">
                 <rect x="30" y="18" width="30" height="98" rx="3" stroke={recState === "recording" ? C.red : "rgba(255,255,255,0.6)"} strokeWidth="0.5" strokeDasharray="3,2" fill="none" />
