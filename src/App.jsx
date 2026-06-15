@@ -1,4 +1,90 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { PoseLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+
+/* ============================================================
+   MediaPipe 骨格検出ユーティリティ
+   ============================================================ */
+const POSE_CONNECTIONS = [
+  [11, 13], [13, 15], [12, 14], [14, 16],   // 腕
+  [11, 12], [23, 24], [11, 23], [12, 24],   // 胴体
+  [23, 25], [25, 27], [24, 26], [26, 28],   // 脚
+  [27, 31], [28, 32],                       // 足
+  [15, 17], [16, 18],                       // 手
+];
+
+// PoseLandmarker をシングルトンで生成
+let _poseLandmarker = null;
+async function getPoseLandmarker() {
+  if (_poseLandmarker) return _poseLandmarker;
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  _poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  });
+  return _poseLandmarker;
+}
+
+// 動画の全フレームから骨格を抽出（解析時に1度だけ実行してキャッシュ）
+async function extractPoseFrames(videoEl, onProgress) {
+  const lm = await getPoseLandmarker();
+  const duration = videoEl.duration;
+  const FPS = 30;
+  const step = 1 / FPS;
+  const frames = [];
+  for (let t = 0; t < duration; t += step) {
+    videoEl.currentTime = t;
+    await new Promise((res) => { videoEl.onseeked = res; });
+    const result = lm.detectForVideo(videoEl, performance.now());
+    frames.push(result.landmarks?.[0] || null);
+    if (onProgress) onProgress(Math.min(1, t / duration));
+  }
+  return frames;
+}
+
+// 3点の角度（度）
+function angleAt(a, b, c) {
+  if (!a || !b || !c) return null;
+  const v1 = { x: a.x - b.x, y: a.y - b.y };
+  const v2 = { x: c.x - b.x, y: c.y - b.y };
+  const dot = v1.x * v2.x + v1.y * v2.y;
+  const m1 = Math.hypot(v1.x, v1.y), m2 = Math.hypot(v2.x, v2.y);
+  return Math.round((Math.acos(dot / (m1 * m2)) * 180) / Math.PI);
+}
+
+// 骨格データから解析値を算出
+function analyzePoseFrames(frames, fps = 30) {
+  const valid = frames.filter(Boolean);
+  if (!valid.length) return null;
+  // 手首(15/16)の最大速度 → ヘッドスピード推定
+  let maxV = 0, impactIdx = 0;
+  for (let i = 1; i < frames.length; i++) {
+    const a = frames[i]?.[15], b = frames[i - 1]?.[15];
+    if (!a || !b) continue;
+    const v = Math.hypot(a.x - b.x, a.y - b.y) * fps;
+    if (v > maxV) { maxV = v; impactIdx = i; }
+  }
+  // 背骨の前傾（肩中点-腰中点の鉛直からの傾き）をアドレス時に測る
+  const f0 = frames.find(Boolean);
+  let spineAngle = null;
+  if (f0) {
+    const sh = { x: (f0[11].x + f0[12].x) / 2, y: (f0[11].y + f0[12].y) / 2 };
+    const hp = { x: (f0[23].x + f0[24].x) / 2, y: (f0[23].y + f0[24].y) / 2 };
+    spineAngle = Math.round((Math.atan2(hp.x - sh.x, hp.y - sh.y) * 180) / Math.PI);
+  }
+  // px/frame正規化値 → m/s推定（キャリブレーション係数は要調整）
+  const CALIB = 95; // 暫定。身長基準でキャリブレーションするとより正確
+  const headSpeed = +(maxV * CALIB).toFixed(1);
+  const distance = Math.round(headSpeed * 4.7); // ヘッドスピード×係数
+  return { headSpeed, distance, impactIdx, impactFrame: impactIdx / frames.length, spineAngle, totalFrames: frames.length };
+}
+
 
 /* ============================================================
    SwingLab v3 — "Atelier Green"
@@ -295,6 +381,86 @@ function Player({ proMode, compact }) {
 }
 const ctrlBtn = { width: 42, height: 42, borderRadius: "50%", border: `1px solid ${C.line}`, background: C.card, display: "flex", alignItems: "center", justifyContent: "center", color: C.sub, cursor: "pointer" };
 
+/* ====== 実写動画 + MediaPipe骨格 の再生プレイヤー ====== */
+function PoseReviewPlayer({ videoUrl, poseFrames }) {
+  const videoRef = useRef(null), canvasRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(0.5);
+  const [skel, setSkel] = useState(true);
+  const [dur, setDur] = useState(0);
+  const [cur, setCur] = useState(0);
+  const rafRef = useRef(null);
+  const MARKS = [{ k: "A", t: 0.08 }, { k: "T", t: 0.5 }, { k: "I", t: 0.8 }, { k: "F", t: 0.96 }];
+
+  // 現在時刻に対応する骨格を描画
+  const draw = useCallback(() => {
+    const v = videoRef.current, cv = canvasRef.current;
+    if (!v || !cv || !poseFrames?.length) return;
+    cv.width = v.videoWidth || cv.offsetWidth;
+    cv.height = v.videoHeight || cv.offsetHeight;
+    const ctx = cv.getContext("2d");
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    if (!skel) return;
+    const idx = Math.min(poseFrames.length - 1, Math.floor((v.currentTime / (v.duration || 1)) * poseFrames.length));
+    const lm = poseFrames[idx];
+    if (!lm) return;
+    ctx.strokeStyle = "#7FD0F5"; ctx.lineWidth = Math.max(2, cv.width / 180);
+    POSE_CONNECTIONS.forEach(([a, b]) => {
+      if (!lm[a] || !lm[b]) return;
+      ctx.beginPath();
+      ctx.moveTo(lm[a].x * cv.width, lm[a].y * cv.height);
+      ctx.lineTo(lm[b].x * cv.width, lm[b].y * cv.height);
+      ctx.stroke();
+    });
+    ctx.fillStyle = "#fff";
+    lm.forEach((p) => { ctx.beginPath(); ctx.arc(p.x * cv.width, p.y * cv.height, Math.max(3, cv.width / 240), 0, 6.3); ctx.fill(); });
+  }, [poseFrames, skel]);
+
+  useEffect(() => {
+    const loop = () => { draw(); if (videoRef.current) setCur(videoRef.current.currentTime); rafRef.current = requestAnimationFrame(loop); };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+  }, [draw]);
+
+  useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = speed; }, [speed]);
+
+  const toggle = () => { const v = videoRef.current; if (!v) return; if (playing) v.pause(); else v.play(); setPlaying(!playing); };
+  const seek = (t) => { if (videoRef.current) { videoRef.current.currentTime = t; videoRef.current.pause(); setPlaying(false); } };
+  const stepFrame = (dir) => { if (videoRef.current) { videoRef.current.currentTime = Math.max(0, Math.min(dur, videoRef.current.currentTime + dir / 30)); videoRef.current.pause(); setPlaying(false); } };
+  const phase = (() => { const r = dur ? cur / dur : 0; return r < 0.2 ? "Address" : r < 0.45 ? "Backswing" : r < 0.55 ? "Top" : r < 0.75 ? "Downswing" : r < 0.85 ? "Impact" : "Follow"; })();
+
+  return (
+    <div>
+      <div style={{ position: "relative", borderRadius: 16, overflow: "hidden", background: "#162B3B", aspectRatio: "9/13", maxHeight: 420 }}>
+        <video ref={videoRef} src={videoUrl} muted playsInline onLoadedMetadata={(e) => setDur(e.target.duration)} onEnded={() => setPlaying(false)} style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+        <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }} />
+        <div style={{ position: "absolute", top: 12, left: 12, background: "rgba(22,43,59,0.55)", color: "#fff", fontSize: 11, fontWeight: 600, padding: "4px 11px", borderRadius: 14, fontFamily: mono }}>{phase}</div>
+      </div>
+      <div style={{ padding: "16px 4px 4px" }}>
+        <input type="range" min={0} max={dur || 1} step="0.01" value={cur} onChange={(e) => seek(+e.target.value)} style={{ width: "100%", accentColor: C.green, height: 4 }} />
+        <div style={{ position: "relative", height: 24, marginTop: 4 }}>
+          {MARKS.map((m) => (
+            <div key={m.k} onClick={() => seek(m.t * dur)} style={{ position: "absolute", left: `${m.t * 100}%`, transform: "translateX(-50%)", cursor: "pointer" }}>
+              <div style={{ width: 20, height: 20, borderRadius: "50%", border: `1px solid ${C.line}`, background: C.card, color: C.sub, fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: mono }}>{m.k}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 18, padding: "8px 0 14px" }}>
+        <div onClick={() => stepFrame(-1)} style={ctrlBtn}><IconBack size={16} /></div>
+        <div onClick={toggle} style={{ width: 54, height: 54, borderRadius: "50%", background: C.green, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: `0 6px 18px ${C.green}44` }}>
+          {playing ? <Icon size={20}><rect x="6" y="5" width="4" height="14" fill="currentColor" stroke="none" /><rect x="14" y="5" width="4" height="14" fill="currentColor" stroke="none" /></Icon> : <IconPlay size={20} />}
+        </div>
+        <div onClick={() => stepFrame(1)} style={ctrlBtn}><IconNext size={16} /></div>
+      </div>
+      <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap" }}>
+        {[0.25, 0.5, 1].map((s) => <button key={s} onClick={() => setSpeed(s)} style={chip(speed === s)}>{s === 1 ? "等速" : `${s}x`}</button>)}
+        <button onClick={() => setSkel((v) => !v)} style={chip(skel)}><IconSkeleton size={14} />骨格</button>
+      </div>
+    </div>
+  );
+}
+
 /* ============================================================ MAIN */
 function UserApp({ onLogout }) {
   const [tab, setTab] = useState("round");
@@ -308,6 +474,12 @@ function UserApp({ onLogout }) {
   const [compareMode, setCompareMode] = useState(false);
   const videoRef = useRef(null), streamRef = useRef(null), recTimer = useRef(null), detectTimer = useRef(null);
   const [recTime, setRecTime] = useState(0);
+  // MediaPipe関連
+  const recorderRef = useRef(null), chunksRef = useRef([]);
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [poseFrames, setPoseFrames] = useState(null);
+  const [poseProgress, setPoseProgress] = useState(0);
+  const hiddenVideoRef = useRef(null);
   const clubObj = CLUBS.find((c) => c.id === club);
 
   // ラウンド用
@@ -403,22 +575,58 @@ function UserApp({ onLogout }) {
     } catch { alert("カメラを起動できませんでした。アクセスを許可してください。"); }
   };
   const beginDetect = () => { setRecState("detecting"); detectTimer.current = setTimeout(() => startRec(), 2500); };
-  const startRec = () => { setRecState("recording"); setRecTime(0); recTimer.current = setInterval(() => setRecTime((t) => { if (t >= 3) { stopRec(); return t; } return t + 1; }), 700); };
-  const stopRec = () => { clearInterval(recTimer.current); setRecState("done"); };
+  const startRec = () => {
+    setRecState("recording"); setRecTime(0); setVideoUrl(null); setPoseFrames(null);
+    // 実録画
+    try {
+      chunksRef.current = [];
+      const rec = new MediaRecorder(streamRef.current, { mimeType: "video/webm" });
+      rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
+      rec.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: "video/webm" });
+        setVideoUrl(URL.createObjectURL(blob));
+      };
+      rec.start();
+      recorderRef.current = rec;
+    } catch (e) { /* 非対応端末はデモ動作 */ }
+    recTimer.current = setInterval(() => setRecTime((t) => { if (t >= 3) { stopRec(); return t; } return t + 1; }), 700);
+  };
+  const stopRec = () => {
+    clearInterval(recTimer.current);
+    if (recorderRef.current && recorderRef.current.state !== "inactive") recorderRef.current.stop();
+    setRecState("done");
+  };
   useEffect(() => () => { clearInterval(recTimer.current); clearTimeout(detectTimer.current); if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop()); }, []);
 
   const analyze = async () => {
-    setAnalyzing(true); setResult(null);
+    setAnalyzing(true); setResult(null); setPoseProgress(0);
+    // 1) MediaPipeで全フレームの骨格を抽出
+    let poseStats = null;
+    if (videoUrl && hiddenVideoRef.current) {
+      try {
+        const v = hiddenVideoRef.current;
+        v.src = videoUrl;
+        await new Promise((res) => { v.onloadedmetadata = res; });
+        const frames = await extractPoseFrames(v, (p) => setPoseProgress(p));
+        setPoseFrames(frames);
+        poseStats = analyzePoseFrames(frames);
+      } catch (e) { /* 抽出失敗時はAI解析のみ */ }
+    }
+    // 2) 骨格データ（あれば）をAIに渡して講評
     try {
+      const ctx = poseStats ? `骨格解析結果: 推定ヘッドスピード${poseStats.headSpeed}m/s, 推定飛距離${poseStats.distance}y, 背骨前傾角${poseStats.spineAngle}度。` : "骨格データなし。";
       const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1000,
-          system: `ゴルフスイング解析AI。${clubObj.n}のスイングを解析しJSONのみ返す:
-{"speed":数値35-55,"distance":数値,"pathAngle":数値-8〜8,"pathType":"インサイドアウト"|"アウトサイドイン"|"スクエア","score":数値60-95,"radar":{"tech":1-100,"stability":1-100,"power":1-100,"rhythm":1-100,"linkage":1-100},"rating":"S"|"A"|"B+"|"B"|"C","issues":[{"phase":"アドレス"|"トップ"|"ダウン"|"インパクト","title":"課題(15字)","desc":"説明(30字)"}],"advice":["30字以内","30字以内","30字以内"]}
-issuesは2-3個。余計な文字不要。`,
-          messages: [{ role: "user", content: `${clubObj.n}でのスイング。トップでオーバースイング気味、フォロー浅め。リアルな数値で。` }] }) });
-      const d = await r.json(); const txt = (d.content?.[0]?.text || "").replace(/```json|```/g, "").trim(); setResult(JSON.parse(txt));
+          system: `ゴルフスイング解析AI。${clubObj.n}のスイング。${ctx}これを踏まえJSONのみ返す:
+{"speed":数値,"distance":数値,"pathAngle":数値-8〜8,"pathType":"インサイドアウト"|"アウトサイドイン"|"スクエア","score":数値60-95,"radar":{"tech":1-100,"stability":1-100,"power":1-100,"rhythm":1-100,"linkage":1-100},"rating":"S"|"A"|"B+"|"B"|"C","issues":[{"phase":"アドレス"|"トップ"|"ダウン"|"インパクト","title":"課題(15字)","desc":"説明(30字)"}],"advice":["30字以内","30字以内","30字以内"]}
+speed/distanceは骨格解析結果があればそれを優先。issuesは2-3個。余計な文字不要。`,
+          messages: [{ role: "user", content: `${clubObj.n}でのスイング解析をお願いします。` }] }) });
+      const d = await r.json(); const txt = (d.content?.[0]?.text || "").replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(txt);
+      if (poseStats) { parsed.speed = poseStats.headSpeed; parsed.distance = poseStats.distance; }
+      setResult(parsed);
     } catch {
-      setResult({ speed: 43.2, distance: 205, pathAngle: -2.4, pathType: "インサイドアウト", score: 84,
+      setResult({ speed: poseStats?.headSpeed || 43.2, distance: poseStats?.distance || 205, pathAngle: -2.4, pathType: "インサイドアウト", score: 84,
         radar: { tech: 82, stability: 76, power: 88, rhythm: 79, linkage: 85 }, rating: "A",
         issues: [{ phase: "トップ", title: "オーバースイング", desc: "トップでクラブが寝すぎています" }, { phase: "ダウン", title: "右肩の突っ込み", desc: "切り返しで右肩が前に出ています" }],
         advice: ["トップでの間を作ると軌道が安定します", "下半身リードの切り返しを意識しましょう", "フォローを高く取ると飛距離が伸びます"] });
@@ -674,9 +882,11 @@ issuesは2-3個。余計な文字不要。`,
               {recState === "done" && <div style={{ position: "absolute", top: 14, left: 14, background: C.green, color: C.card, fontSize: 12, fontWeight: 700, padding: "6px 13px", borderRadius: 16 }}>✓ 撮影完了</div>}
               {analyzing && <div style={{ position: "absolute", inset: 0, background: "rgba(22,43,59,0.84)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16 }}>
                 <div style={{ width: 44, height: 44, border: "2.5px solid rgba(255,255,255,0.2)", borderTop: `2.5px solid ${C.gold}`, borderRadius: "50%", animation: "spin .8s linear infinite" }} />
-                <div style={{ color: "#fff", fontSize: 12, letterSpacing: "2px", fontFamily: mono }}>ANALYZING</div>
+                <div style={{ color: "#fff", fontSize: 12, letterSpacing: "2px", fontFamily: mono }}>{poseProgress > 0 && poseProgress < 1 ? `骨格抽出 ${Math.round(poseProgress * 100)}%` : "ANALYZING"}</div>
                 <div style={{ position: "absolute", left: 0, right: 0, height: 1.5, background: `linear-gradient(90deg,transparent,${C.gold},transparent)`, animation: "scan 1.5s linear infinite" }} /></div>}
             </div>
+            {/* 骨格抽出用の隠し動画 */}
+            <video ref={hiddenVideoRef} muted playsInline style={{ display: "none" }} />
 
             {/* 三脚ガイド */}
             <div style={{ ...S.card, marginTop: 16, background: C.cardAlt }}>
@@ -786,7 +996,15 @@ issuesは2-3個。余計な文字不要。`,
               <button onClick={() => setCompareMode((c) => !c)} style={chip(compareMode)}><IconCompare size={14} stroke={compareMode ? C.card : C.sub} />比較</button>
             </div>
             {compareMode && <div style={{ ...S.card, padding: 16 }}><div style={{ fontSize: 12, fontWeight: 700, color: C.gold, marginBottom: 10 }}>お手本プロ</div><Player proMode compact /></div>}
-            <div style={S.card}>{compareMode && <div style={{ fontSize: 12, fontWeight: 700, color: C.green, marginBottom: 10 }}>あなた</div>}<Player compact={compareMode} /></div>
+            <div style={S.card}>
+              {compareMode && <div style={{ fontSize: 12, fontWeight: 700, color: C.green, marginBottom: 10 }}>あなた</div>}
+              {videoUrl && poseFrames
+                ? <PoseReviewPlayer videoUrl={videoUrl} poseFrames={poseFrames} />
+                : <>
+                    {!videoUrl && <div style={{ fontSize: 12, color: C.faint, textAlign: "center", marginBottom: 10 }}>「撮影・解析」でスイングを撮ると、実写＋骨格で再生できます（プレビュー版はデモ表示）</div>}
+                    <Player compact={compareMode} />
+                  </>}
+            </div>
           </div>
         )}
 
