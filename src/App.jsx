@@ -571,7 +571,6 @@ function UserApp({ onLogout }) {
 
   const startCamera = async () => {
     setCamErr("カメラ起動を試行中...");
-    // 1) mediaDevices の存在チェック（HTTP接続やWebView制限だとundefinedになる）
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setCamErr("この環境ではカメラAPIが使えません（HTTPSでない／対応外ブラウザの可能性）。https://〜.vercel.app をSafariで直接開いて試してください。");
       return;
@@ -581,12 +580,10 @@ function UserApp({ onLogout }) {
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
       } catch (e1) {
-        // 背面指定で失敗したら制約を緩めて再試行
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       }
       streamRef.current = stream;
-      if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play().catch(() => {}); }
-      setCameraOn(true); setCamErr(""); if (autoRec) beginDetect();
+      setCameraOn(true); setCamErr(""); // ← 先に表示。装着は下のeffectで
     } catch (err) {
       const name = err?.name || "Error";
       const msg = {
@@ -600,6 +597,20 @@ function UserApp({ onLogout }) {
       setCamErr(msg);
     }
   };
+
+  // cameraOnになりvideo要素がマウントされたらstreamを装着して再生
+  useEffect(() => {
+    if (cameraOn && videoRef.current && streamRef.current) {
+      const v = videoRef.current;
+      v.srcObject = streamRef.current;
+      v.play().then(() => { if (autoRec && recState === "idle") beginDetect(); }).catch(() => {
+        // 自動再生がブロックされた場合に備えもう一度
+        setTimeout(() => v.play().catch(() => {}), 300);
+        if (autoRec && recState === "idle") beginDetect();
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cameraOn]);
   const beginDetect = () => { setRecState("detecting"); detectTimer.current = setTimeout(() => startRec(), 2500); };
   const startRec = () => {
     setRecState("recording"); setRecTime(0); setVideoUrl(null); setPoseFrames(null);
@@ -897,7 +908,7 @@ speed/distanceは骨格解析結果があればそれを優先。issuesは2-3個
 
             {/* カメラ */}
             <div style={{ position: "relative", borderRadius: 20, overflow: "hidden", aspectRatio: "9/13", maxHeight: 440, boxShadow: "0 8px 30px rgba(42,38,32,0.12)" }}>
-              {cameraOn ? <video ref={videoRef} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover" }} /> :
+              {cameraOn ? <video ref={videoRef} muted playsInline autoPlay controls={false} style={{ width: "100%", height: "100%", objectFit: "cover", background: "#000" }} /> :
                 <div onClick={startCamera} style={{ position: "absolute", inset: 0, cursor: "pointer" }}><SwingStage frame={8} withSkeleton={false} />
                   <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14, color: "#fff", padding: 20, textAlign: "center" }}>
                     <IconCamera size={40} stroke="#fff" sw={1.4} />
